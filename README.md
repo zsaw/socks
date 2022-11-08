@@ -55,10 +55,10 @@ package main
 
 import (
     "bufio"
-	"log"
-	"net"
-	"net/http"
-	"os"
+    "log"
+    "net"
+    "net/http"
+    "os"
 
     "github.com/zsaw/socks"
 )
