@@ -11,37 +11,6 @@ import (
 	"strings"
 )
 
-type cmd byte
-
-const (
-	Connect cmd = iota + 1
-	Bind
-	Udp
-)
-
-type atyp byte
-
-const (
-	IPv4 atyp = iota + 1
-	_
-	Domain
-	IPv6
-)
-
-type rep byte
-
-const (
-	Succeeded rep = iota
-	GeneralSocks5ServerFailure
-	ConnectionNotAllowedByRuleset
-	NetworkUnreachable
-	HostUnreachable
-	ConnectionRefused
-	TTLExpired
-	CommandNotSupported
-	AddressTypeNotSupported
-)
-
 func genAddrByAtyp(a atyp, addr string) ([]byte, error) {
 	byts := make([]byte, 0)
 	switch a {

@@ -1,7 +1,7 @@
 package socks
 
 import (
-	"bytes"
+	"bufio"
 	"errors"
 	"io"
 	"log"
@@ -9,106 +9,28 @@ import (
 	"sync"
 )
 
-func newConn(conn net.Conn) {
-	defer conn.Close()
-
-	err := consult(conn)
-	if err != nil {
-		log.Println(err.Error())
-		return
-	}
-
-	err = responseWriter(conn)
-	if err != nil {
-		log.Println(err.Error())
-		return
-	}
+type Handler interface {
+	Consult(ConsultWriter, ConsultRequest) (method, error)
+	Auth(AuthWriter, AuthRequest) error
+	Forward(ForwardWriter, ForwardRequest) (net.Conn, error)
 }
 
-var ErrUnsupportedVersion = errors.New("unsupported version")
-
-func consult(conn net.Conn) (err error) {
-	msg := make([]byte, 2)
-	_, err = conn.Read(msg)
-	if err != nil {
-		return err
-	}
-
-	if msg[0] != 5 {
-		return ErrUnsupportedVersion
-	}
-
-	msg = make([]byte, msg[1])
-	_, err = conn.Read(msg)
-	if err != nil {
-		return err
-	}
-
-	if bytes.IndexByte(msg, 0) < 0 {
-		_, err = conn.Write([]byte{5, 0xff})
-		if err != nil {
-			return err
-		}
-		return errors.New("unsupported method")
-	}
-
-	_, err = conn.Write([]byte{5, 0})
-	return err
+func Serve(l net.Listener, handler Handler, consult ConsultRequest, auth AuthRequest, forward ForwardRequest) error {
+	srv := &Server{Addr: l.Addr().String(), Handler: handler}
+	return srv.Serve(l, consult, auth, forward)
 }
 
-func responseWriter(sconn net.Conn) error {
-	req, err := ReadRequest(sconn)
-	if err != nil {
-		return err
-	}
-	switch req[1] {
-	case byte(Connect):
-		dconn, err := net.Dial("tcp", req.Addr())
-		if err != nil {
-			return err
-		}
-		resp, _ := NewRespone(Succeeded, req.AddrType(), req.Addr())
-		_, err = sconn.Write(resp)
-		if err != nil {
-			return err
-		}
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			_, err = io.Copy(dconn, sconn)
-			if err != nil {
-				return
-			}
-		}()
-		go func() {
-			_, err = io.Copy(sconn, dconn)
-			if err != nil {
-				return
-			}
-		}()
-		wg.Wait()
-		return nil
-	case 2:
-		return errors.New("bind method not supported")
-	case 3:
-		return errors.New("udp method not supported")
-	default:
-		return errors.New("unexpected cmd")
-	}
-}
-
-func Serve(l net.Listener) error {
-	srv := &Server{Addr: l.Addr().String()}
-	return srv.Serve(l)
-}
-
-func ListenAndServe(addr string) error {
-	srv := &Server{Addr: addr}
+func ListenAndServe(addr string, handler Handler) error {
+	srv := &Server{Addr: addr, Handler: handler}
 	return srv.ListenAndServe()
 }
 
 type Server struct {
-	Addr string
+	Addr          string
+	Handler       Handler
+	consultWriter ConsultWriter
+	authWriter    AuthWriter
+	forwardWriter ForwardWriter
 }
 
 func (srv *Server) ListenAndServe() error {
@@ -120,15 +42,92 @@ func (srv *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	return srv.Serve(ln)
+	return srv.Serve(ln, nil, nil, nil)
 }
 
-func (srv *Server) Serve(l net.Listener) error {
+func (srv *Server) Serve(l net.Listener, consult ConsultRequest, auth AuthRequest, forward ForwardRequest) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
 			return err
 		}
-		go newConn(conn)
+
+		if consult == nil {
+			srv.consultWriter = &consultWriter{conn: conn}
+		}
+		if auth == nil {
+			srv.authWriter = &authWriter{conn: conn}
+		}
+		if forward == nil {
+			srv.forwardWriter = &forwardWriter{conn: conn}
+		}
+
+		go func(conn net.Conn, h Handler) {
+			defer conn.Close()
+
+			creq, err := ReadConsultRequest(bufio.NewReader(conn))
+			if err != nil {
+				log.Println(err.Error())
+				return
+			}
+
+			method, err := h.Consult(srv.consultWriter, creq)
+			if err != nil {
+				log.Println(err.Error())
+				return
+			}
+
+			switch method {
+			case NoAuthenticationRequired:
+			case UsernamePassword:
+				areq, err := ReadAuthRequest(bufio.NewReader(conn))
+				if err != nil {
+					log.Println(err.Error())
+					return
+				}
+
+				err = h.Auth(srv.authWriter, areq)
+				if err != nil {
+					log.Println(err.Error())
+					return
+				}
+			default:
+				log.Println(errors.New("unsupported method"))
+				return
+			}
+
+			freq, err := ReadForwardRequest(bufio.NewReader(conn))
+			if err != nil {
+				log.Println(err.Error())
+				return
+			}
+
+			dconn, err := h.Forward(srv.forwardWriter, freq)
+			if err != nil {
+				log.Println(err.Error())
+				return
+			}
+			defer dconn.Close()
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, err := io.Copy(conn, dconn)
+				if err != nil {
+					log.Println(err.Error())
+					return
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				_, err := io.Copy(dconn, conn)
+				if err != nil {
+					log.Println(err.Error())
+					return
+				}
+			}()
+			wg.Wait()
+		}(conn, srv.Handler)
 	}
 }
